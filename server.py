@@ -66,16 +66,40 @@ class SingleUserOAuthProvider:
         self._client_id = client_id
         self._client_secret = client_secret
         # In-memory stores
-        self._clients: dict[str, OAuthClientInformationFull] = {}
         self._auth_codes: dict[str, AuthorizationCode] = {}
         self._access_tokens: dict[str, AccessToken] = {}
         self._refresh_tokens: dict[str, RefreshToken] = {}
+        # Pre-seed the single allowed client so /authorize works without
+        # requiring a separate /register call first.
+        self._clients: dict[str, OAuthClientInformationFull] = {
+            client_id: OAuthClientInformationFull(
+                client_id=client_id,
+                client_secret=client_secret,
+                client_id_issued_at=int(time.time()),
+                client_secret_expires_at=0,
+                redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+                token_endpoint_auth_method="client_secret_post",
+                grant_types=["authorization_code", "refresh_token"],
+                response_types=["code"],
+                scope="claudeai",
+            )
+        }
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         return self._clients.get(client_id)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        # Accept any registration but assign our known client_id/secret
+        # Accept registration, assign our known credentials, and merge
+        # any new redirect_uris the client declares.
+        existing = self._clients.get(self._client_id)
+        if existing and client_info.redirect_uris:
+            all_uris = list(existing.redirect_uris or [])
+            for uri in client_info.redirect_uris:
+                if uri not in all_uris:
+                    all_uris.append(uri)
+            existing.redirect_uris = all_uris
+            existing.scope = client_info.scope or existing.scope
+
         client_info.client_id = self._client_id
         client_info.client_secret = self._client_secret
         client_info.client_id_issued_at = int(time.time())

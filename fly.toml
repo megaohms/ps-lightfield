@@ -1,9 +1,9 @@
-# fly.toml app configuration file generated for ps-lightfield on 2026-03-26T20:36:33-07:00
+# fly.toml app configuration file generated for ps-lightfield-withered-water-3835 on 2026-03-26T20:39:26-07:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'ps-lightfield'
+app = 'ps-lightfield-withered-water-3835'
 primary_region = 'sjc'
 
 [build]

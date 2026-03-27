@@ -7,21 +7,26 @@ Requirements:
   pip install mcp httpx
 
 Usage:
-  LIGHTFIELD_API_KEY=sk_lf_... python server.py
+  LIGHTFIELD_API_KEY=sk_lf_... MCP_CLIENT_ID=... MCP_CLIENT_SECRET=... python server.py
 
-Then register https://your-server/mcp in Claude.ai Settings > Connectors.
+Then register https://your-server/sse in Claude.ai Settings > Connectors.
 """
 
-import asyncio
-import hmac
 import os
+import secrets
+import time
 
 import httpx
-import uvicorn
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse
 from mcp.server.fastmcp import FastMCP
+from mcp.server.auth.provider import (
+    AuthorizationCode,
+    AuthorizationParams,
+    AccessToken,
+    RefreshToken,
+    construct_redirect_uri,
+)
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 # ---------------------------------------------------------------------------
 # Config
@@ -31,16 +36,13 @@ LIGHTFIELD_BASE = "https://api.lightfield.app/v1"
 LIGHTFIELD_VERSION = "2026-03-01"
 API_KEY = os.environ["LIGHTFIELD_API_KEY"]
 
-# Auth: single hard-coded client_id / client_secret pair.
-# Generate secure defaults if not provided, but then they must be set
-# explicitly so the operator knows the values.
 MCP_CLIENT_ID = os.environ.get("MCP_CLIENT_ID", "")
 MCP_CLIENT_SECRET = os.environ.get("MCP_CLIENT_SECRET", "")
+SERVER_URL = os.environ.get("MCP_SERVER_URL", "https://ps-lightfield-withered-water-3835.fly.dev")
 
 if not MCP_CLIENT_ID or not MCP_CLIENT_SECRET:
     raise RuntimeError(
-        "MCP_CLIENT_ID and MCP_CLIENT_SECRET env vars are required. "
-        "Set them to a shared secret that your MCP client will send as query params."
+        "MCP_CLIENT_ID and MCP_CLIENT_SECRET env vars are required."
     )
 
 HEADERS = {
@@ -49,31 +51,166 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-mcp = FastMCP("lightfield")
+
+# ---------------------------------------------------------------------------
+# Single-user OAuth provider (in-memory, auto-approve)
+# ---------------------------------------------------------------------------
+
+class SingleUserOAuthProvider:
+    """
+    Minimal OAuth 2.0 authorization server for a single hard-coded user.
+    No login UI — authorize() auto-approves and redirects immediately.
+    """
+
+    def __init__(self, client_id: str, client_secret: str):
+        self._client_id = client_id
+        self._client_secret = client_secret
+        # In-memory stores
+        self._clients: dict[str, OAuthClientInformationFull] = {}
+        self._auth_codes: dict[str, AuthorizationCode] = {}
+        self._access_tokens: dict[str, AccessToken] = {}
+        self._refresh_tokens: dict[str, RefreshToken] = {}
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        return self._clients.get(client_id)
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        # Accept any registration but assign our known client_id/secret
+        client_info.client_id = self._client_id
+        client_info.client_secret = self._client_secret
+        client_info.client_id_issued_at = int(time.time())
+        client_info.client_secret_expires_at = 0  # never expires
+        self._clients[self._client_id] = client_info
+
+    async def authorize(
+        self, client: OAuthClientInformationFull, params: AuthorizationParams
+    ) -> str:
+        # Auto-approve: generate auth code and redirect back immediately
+        code = secrets.token_urlsafe(32)  # 256 bits of entropy
+        self._auth_codes[code] = AuthorizationCode(
+            code=code,
+            scopes=params.scopes or [],
+            expires_at=time.time() + 300,  # 5 min expiry
+            client_id=client.client_id,
+            code_challenge=params.code_challenge,
+            redirect_uri=params.redirect_uri,
+            redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
+            resource=params.resource,
+        )
+        return construct_redirect_uri(
+            str(params.redirect_uri), code=code, state=params.state
+        )
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> AuthorizationCode | None:
+        return self._auth_codes.get(authorization_code)
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        # Remove used code (one-time use)
+        self._auth_codes.pop(authorization_code.code, None)
+
+        access = secrets.token_urlsafe(32)
+        refresh = secrets.token_urlsafe(32)
+
+        self._access_tokens[access] = AccessToken(
+            token=access,
+            client_id=client.client_id,
+            scopes=authorization_code.scopes,
+            expires_at=int(time.time()) + 3600,  # 1 hour
+            resource=authorization_code.resource,
+        )
+        self._refresh_tokens[refresh] = RefreshToken(
+            token=refresh,
+            client_id=client.client_id,
+            scopes=authorization_code.scopes,
+        )
+
+        return OAuthToken(
+            access_token=access,
+            token_type="Bearer",
+            expires_in=3600,
+            refresh_token=refresh,
+            scope=" ".join(authorization_code.scopes) if authorization_code.scopes else None,
+        )
+
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> RefreshToken | None:
+        return self._refresh_tokens.get(refresh_token)
+
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        # Rotate tokens
+        self._refresh_tokens.pop(refresh_token.token, None)
+
+        access = secrets.token_urlsafe(32)
+        new_refresh = secrets.token_urlsafe(32)
+        use_scopes = scopes or refresh_token.scopes
+
+        self._access_tokens[access] = AccessToken(
+            token=access,
+            client_id=client.client_id,
+            scopes=use_scopes,
+            expires_at=int(time.time()) + 3600,
+        )
+        self._refresh_tokens[new_refresh] = RefreshToken(
+            token=new_refresh,
+            client_id=client.client_id,
+            scopes=use_scopes,
+        )
+
+        return OAuthToken(
+            access_token=access,
+            token_type="Bearer",
+            expires_in=3600,
+            refresh_token=new_refresh,
+            scope=" ".join(use_scopes) if use_scopes else None,
+        )
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        at = self._access_tokens.get(token)
+        if at and at.expires_at and at.expires_at < time.time():
+            self._access_tokens.pop(token, None)
+            return None
+        return at
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        if isinstance(token, AccessToken):
+            self._access_tokens.pop(token.token, None)
+        elif isinstance(token, RefreshToken):
+            self._refresh_tokens.pop(token.token, None)
 
 
 # ---------------------------------------------------------------------------
-# Auth middleware – checks ?client_id=…&client_secret=… on every request
+# Build server with OAuth
 # ---------------------------------------------------------------------------
 
-class ClientCredentialsAuthMiddleware(BaseHTTPMiddleware):
-    """Reject requests that don't carry the correct client_id + client_secret."""
+oauth_provider = SingleUserOAuthProvider(MCP_CLIENT_ID, MCP_CLIENT_SECRET)
 
-    async def dispatch(self, request: Request, call_next):
-        client_id = request.query_params.get("client_id", "")
-        client_secret = request.query_params.get("client_secret", "")
-
-        # Constant-time comparison to prevent timing attacks
-        id_ok = hmac.compare_digest(client_id, MCP_CLIENT_ID)
-        secret_ok = hmac.compare_digest(client_secret, MCP_CLIENT_SECRET)
-
-        if not (id_ok and secret_ok):
-            return JSONResponse(
-                {"error": "invalid_client", "message": "Invalid client_id or client_secret"},
-                status_code=401,
-            )
-
-        return await call_next(request)
+mcp = FastMCP(
+    "lightfield",
+    auth_server_provider=oauth_provider,
+    auth=AuthSettings(
+        issuer_url=SERVER_URL,
+        resource_server_url=SERVER_URL,
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,
+            valid_scopes=["claudeai"],
+            default_scopes=["claudeai"],
+        ),
+        revocation_options=RevocationOptions(enabled=True),
+        required_scopes=[],
+    ),
+    host="0.0.0.0",
+    port=int(os.environ.get("PORT", 8000)),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -242,12 +379,4 @@ def get_customer_snapshot(account_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Build the SSE Starlette app from FastMCP, then wrap it with auth.
-    port = int(os.environ.get("PORT", 8000))
-
-    app = mcp.sse_app()
-    app.add_middleware(ClientCredentialsAuthMiddleware)
-
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
-    server = uvicorn.Server(config)
-    asyncio.run(server.serve())
+    mcp.run(transport="sse")

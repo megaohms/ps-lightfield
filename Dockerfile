@@ -5,11 +5,3 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py .
 EXPOSE 8080
 CMD ["python", "server.py"]
-```
-
-`.gitignore`:
-```
-.venv/
-__pycache__/
-*.pyc
-.env
